@@ -4,7 +4,6 @@ import json
 import asyncio
 import random
 import re
-import subprocess
 from pathlib import Path
 from datetime import datetime
 import httpx
@@ -17,7 +16,10 @@ if sys.platform.startswith('win'):
 # ---------------------------------------------------------
 # 1. Batch Folder Setup
 # ---------------------------------------------------------
-BATCH_FOLDER_NAME = os.environ.get("BATCH_FOLDER_NAME", f"Batch--{datetime.now().strftime('%Y-%m-%d-%A_%I-%M-%S-%p')}")
+BATCH_FOLDER_NAME = os.environ.get(
+    "BATCH_FOLDER_NAME",
+    f"Batch--{datetime.now().strftime('%Y-%m-%d-%A_%I-%M-%S-%p')}"
+)
 
 try:
     os.makedirs(BATCH_FOLDER_NAME, exist_ok=True)
@@ -26,32 +28,29 @@ except Exception as e:
     logger.warning(f"⚠️ Folder Error: {e}")
 
 CONFIG = {
-    "base_dir": BATCH_FOLDER_NAME,
-    "download_media": True,
-    "http2": False,
-    "proxy": None,
-    "timeout": 60.0,
-    "delay_between_pages": (1.0, 2.5),
-    "delay_between_videos": (2.0, 5.0),
-    "video_concurrency": 7,
-    "comment_concurrency": 5,
-    "max_comments_limit": 10000,
-    "rclone_remote": "vfx"
+    "base_dir":               BATCH_FOLDER_NAME,
+    "download_media":         True,
+    "http2":                  False,
+    "proxy":                  None,
+    "timeout":                60.0,
+    "delay_between_pages":    (1.0, 2.5),
+    "delay_between_videos":   (1.0, 3.0),   # SPEED: thoda kam kiya
+    "video_concurrency":      10,            # SPEED: 7 → 10
+    "comment_concurrency":    8,             # SPEED: 5 → 8
+    "max_comments_limit":     10000,
+    "rclone_remote":          "vfx"
 }
 
 # ---------------------------------------------------------
-# 2. TXT-Based Tracking System (Redis removed)
+# 2. TXT-Based Tracking System (No Redis)
 # ---------------------------------------------------------
-TRACKING_FILE = "tracking_report.txt"   # success / failed / skipped log
-COMPLETED_FILE = "completed.txt"        # successfully done URLs (for resume)
-FAILED_FILE    = "failed.txt"           # failed URLs (retry next run)
-LOG_FILE       = "scraper_log.txt"      # full detailed log
-
-_file_lock_sync = None  # will be set in main()
+TRACKING_FILE  = "tracking_report.txt"
+COMPLETED_FILE = "completed.txt"
+FAILED_FILE    = "failed.txt"
+LOG_FILE       = "scraper_log.txt"
 
 def _append_tracking(status: str, url: str, note: str = ""):
-    """Write one line to tracking_report.txt — called from sync context only."""
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] [{status}] {url}"
     if note:
         line += f" | {note}"
@@ -108,16 +107,18 @@ def human_ts(unix_ts):
         return datetime.now().strftime("%Y-%m-%d_%H-%M")
 
 # ---------------------------------------------------------
-# 5. YT-DLP Fallback
+# 5. YT-DLP — noprogress fix (speed + clean logs)
 # ---------------------------------------------------------
 def download_with_ytdlp(url, output_path):
     ydl_opts = {
-        'outtmpl': str(output_path),
-        'quiet': True,
-        'no_warnings': True,
-        'format': 'bestvideo[vcodec~="^avc|^h264"]+bestaudio[ext=m4a]/best[ext=mp4][vcodec~="^avc|^h264"]/bestvideo+bestaudio/best',
-        'merge_output_format': 'mp4',
-        'format_sort': ['vcodec:h264'],
+        'outtmpl':            str(output_path),
+        'quiet':              True,
+        'no_warnings':        True,
+        'noprogress':         True,      # SPEED FIX: progress spam band
+        'socket_timeout':     30,        # SPEED FIX: timeout
+        'format':             'bestvideo[vcodec~="^avc|^h264"]+bestaudio[ext=m4a]/best[ext=mp4][vcodec~="^avc|^h264"]/bestvideo+bestaudio/best',
+        'merge_output_format':'mp4',
+        'format_sort':        ['vcodec:h264'],
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -128,21 +129,18 @@ def download_with_ytdlp(url, output_path):
         return False
 
 # ---------------------------------------------------------
-# 6. Rclone Upload to Mega
+# 6. Rclone Upload — async (non-blocking)
 # ---------------------------------------------------------
 async def upload_to_mega(local_folder_path, folder_name, log_prefix):
     try:
         remote_path = f"{CONFIG['rclone_remote']}:/{BATCH_FOLDER_NAME}/{folder_name}"
-        logger.info(f"{log_prefix} ☁️ Starting Mega Upload → {remote_path}")
+        logger.info(f"{log_prefix} ☁️ Mega Upload → {remote_path}")
         cmd = [
             "rclone", "copy", str(local_folder_path), remote_path,
-            "--transfers", "32", "--checkers", "64",
-            "--log-level", "ERROR"
+            "--transfers", "32", "--checkers", "64", "--log-level", "ERROR"
         ]
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         _, stderr = await proc.communicate()
         if proc.returncode == 0:
@@ -156,39 +154,26 @@ async def upload_to_mega(local_folder_path, folder_name, log_prefix):
         else:
             logger.error(f"{log_prefix} ❌ rclone error: {stderr.decode().strip()}")
     except Exception as e:
-        logger.error(f"{log_prefix} ❌ Mega Upload Exception: {e}")
+        logger.error(f"{log_prefix} ❌ Upload Exception: {e}")
 
-# ---------------------------------------------------------
-# 7. Upload tracking/log files to Mega root
-# ---------------------------------------------------------
 async def upload_report_files():
-    """Upload tracking_report.txt, scraper_log.txt to Mega root after run."""
-    files_to_upload = [TRACKING_FILE, LOG_FILE, COMPLETED_FILE, FAILED_FILE]
-    for fpath in files_to_upload:
+    """Upload all tracking/log files to Mega _Reports folder after run."""
+    for fpath in [TRACKING_FILE, LOG_FILE, COMPLETED_FILE, FAILED_FILE]:
         if not os.path.exists(fpath):
             continue
         try:
             remote_path = f"{CONFIG['rclone_remote']}:/{BATCH_FOLDER_NAME}/_Reports"
-            logger.info(f"☁️ Uploading report file: {fpath} → {remote_path}")
-            cmd = [
-                "rclone", "copy", fpath, remote_path,
-                "--log-level", "ERROR"
-            ]
+            cmd = ["rclone", "copy", fpath, remote_path, "--log-level", "ERROR"]
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
-            _, stderr = await proc.communicate()
-            if proc.returncode == 0:
-                logger.success(f"✅ Report uploaded: {fpath}")
-            else:
-                logger.error(f"❌ Report upload failed: {stderr.decode().strip()}")
+            await proc.communicate()
+            logger.success(f"✅ Report uploaded: {fpath}")
         except Exception as e:
-            logger.error(f"❌ Report upload exception: {e}")
+            logger.error(f"❌ Report upload failed ({fpath}): {e}")
 
 # ---------------------------------------------------------
-# 8. Scraper Engine
+# 7. Scraper Engine
 # ---------------------------------------------------------
 class TikTokScraperV4:
     def __init__(self, config):
@@ -196,10 +181,14 @@ class TikTokScraperV4:
         self.base_path = Path(config["base_dir"])
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://www.tiktok.com/"
+            "Accept":     "application/json, text/plain, */*",
+            "Referer":    "https://www.tiktok.com/"
         }
-        self.client = httpx.AsyncClient(http2=config["http2"], timeout=config["timeout"])
+        self.client = httpx.AsyncClient(
+            http2=config["http2"],
+            timeout=config["timeout"],
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20)
+        )
         self.sem_comments = asyncio.Semaphore(config["comment_concurrency"])
 
     async def download_file_httpx(self, url, path, log_prefix, item_name="Media"):
@@ -217,14 +206,14 @@ class TikTokScraperV4:
             logger.success(f"{log_prefix} 📥 Saved: {item_name}")
             return True
         except Exception as e:
-            logger.error(f"{log_prefix} ❌ {item_name} Download Error: {e}")
+            logger.error(f"{log_prefix} ❌ {item_name} Error: {e}")
             return False
 
     async def get_video_meta(self, url, track_id):
         clean_url = url.replace("/photo/", "/video/")
         logger.info(f"{track_id} 🌐 Fetching HTML page...")
         try:
-            resp = await self.client.get(clean_url, headers=self.headers, follow_redirects=True)
+            resp  = await self.client.get(clean_url, headers=self.headers, follow_redirects=True)
             match = re.search(
                 r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">([\s\S]*?)</script>',
                 resp.text
@@ -232,16 +221,22 @@ class TikTokScraperV4:
             if not match:
                 return None
             data = json.loads(match.group(1))
-            item = data.get("__DEFAULT_SCOPE__", {}).get("webapp.video-detail", {}).get("itemInfo", {}).get("itemStruct")
+            item = (data.get("__DEFAULT_SCOPE__", {})
+                        .get("webapp.video-detail", {})
+                        .get("itemInfo", {})
+                        .get("itemStruct"))
             if not item:
-                item = data.get("__DEFAULT_SCOPE__", {}).get("webapp.image-detail", {}).get("itemInfo", {}).get("itemStruct")
+                item = (data.get("__DEFAULT_SCOPE__", {})
+                            .get("webapp.image-detail", {})
+                            .get("itemInfo", {})
+                            .get("itemStruct"))
             return item
         except:
             return None
 
     async def scrape_video(self, url, index, total, file_lock):
-        track_id = f"[{index}/{total}]"
-        logger.info(f"{'-'*50}\n{track_id} 🚀 Checking URL: {url}")
+        track_id   = f"[{index}/{total}]"
+        logger.info(f"{'-'*50}\n{track_id} 🚀 URL: {url}")
 
         item = await self.get_video_meta(url, track_id)
         if not item:
@@ -255,83 +250,133 @@ class TikTokScraperV4:
         post_ts     = human_ts(item.get("createTime"))
         log_prefix  = f"{track_id} [@{author}]"
 
-        folder_prefix = f"@{author}_{desc_slug}_{v_id}"
-        v_path = self.base_path / folder_prefix
+        # Folder + file naming — same as prof-scraper
+        file_prefix   = f"@{author}_{desc_slug}_{v_id}"
+        folder_prefix = file_prefix
+        v_path        = self.base_path / folder_prefix
         v_path.mkdir(exist_ok=True)
 
-        base_name_format = f"@{author}_{desc_slug}"
+        # ── 1. ALL JSON FILES (matching prof-scraper) ──────────────────────
 
-        # Metadata
-        (v_path / f"{base_name_format}_RAWmeta_{post_ts}_{v_id}.json").write_text(
+        # RAW full API response
+        (v_path / f"RAW_meta__{file_prefix}.json").write_text(
             json.dumps(item, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        clean_meta = {
-            "post_info": {"id": v_id, "posted_at": post_ts},
-            "author": item.get("author", {}),
-            "stats": item.get("stats", {})
-        }
-        (v_path / f"{base_name_format}_Meta_{post_ts}_{v_id}.json").write_text(
-            json.dumps(clean_meta, indent=2, ensure_ascii=False), encoding="utf-8")
-        logger.success(f"{log_prefix} 📝 Metadata saved.")
+        # Clean meta: stats + author + music
+        (v_path / f"meta__{file_prefix}.json").write_text(
+            json.dumps({
+                "post_info": {
+                    "id":         v_id,
+                    "desc":       item.get("desc"),
+                    "createTime": item.get("createTime"),
+                    "posted_at":  post_ts
+                },
+                "stats":  item.get("statsV2", item.get("stats", {})),
+                "author": item.get("author", {}),
+                "music":  item.get("music", {})
+            }, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        # Media Logic
+        # Caption: username + url + caption + hashtags
+        (v_path / f"caption__{file_prefix}.json").write_text(
+            json.dumps({
+                "username": author,
+                "post_url": url,
+                "caption":  item.get("desc", ""),
+                "hashtags": re.findall(r"#\w+", item.get("desc", ""))
+            }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # Account: author details + author stats
+        (v_path / f"account__{file_prefix}.json").write_text(
+            json.dumps({
+                "author_details": item.get("author", {}),
+                "author_stats":   item.get("authorStats", {})
+            }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        logger.success(f"{log_prefix} 📝 Saved: RAW_meta, meta, caption, account")
+
+        # ── 2. MEDIA DOWNLOADS ─────────────────────────────────────────────
         if self.cfg.get("download_media", True):
-            avatar_url = item.get("author", {}).get("avatarLarger")
+
+            # Avatar
+            avatar_url = (item.get("author", {}).get("avatarLarger")
+                          or item.get("author", {}).get("avatarMedium"))
             if avatar_url:
                 await self.download_file_httpx(
-                    avatar_url,
-                    v_path / f"{base_name_format}_Avatar_{post_ts}_{v_id}.jpg",
-                    log_prefix, "Avatar")
+                    avatar_url, v_path / f"avatar__{file_prefix}.jpg", log_prefix, "Avatar")
 
+            # Photo carousel OR video
             image_post = item.get("imagePost")
             if image_post and image_post.get("images"):
-                logger.info(f"{log_prefix} 📸 Photo/Carousel mode.")
+                logger.info(f"{log_prefix} 📸 Carousel mode.")
                 for i, img in enumerate(image_post.get("images", [])):
                     img_url = (img.get("imageURL", {}).get("urlList", [None])[0]
                                or img.get("displayImage", {}).get("urlList", [None])[0])
                     if img_url:
                         await self.download_file_httpx(
                             img_url,
-                            v_path / f"{base_name_format}_Carousel{i+1:03d}_{post_ts}_{v_id}.jpg",
-                            log_prefix, f"Image {i+1}")
+                            v_path / f"carousel_{i+1:03d}__{file_prefix}.jpg",
+                            log_prefix, f"Carousel {i+1}")
             else:
-                video_path = v_path / f"{base_name_format}_Video_{post_ts}_{v_id}.mp4"
-                logger.info(f"{log_prefix} 📥 Starting direct download...")
+                # Find best play URL
+                video_data = item.get("video", {})
+                play_url   = None
 
-                play_addr = item.get("video", {}).get("playAddr")
-                if isinstance(play_addr, list):
-                    play_addr = play_addr[0]
-
-                success = False
-                if play_addr:
+                # Priority 1: bitrateInfo (highest quality)
+                for br in (video_data.get("bitrateInfo") or video_data.get("bitRateList") or []):
                     try:
-                        resp = await self.client.get(play_addr, headers=self.headers, timeout=60, follow_redirects=True)
+                        play_url = br.get("PlayAddr", {}).get("UrlList", [None])[0]
+                        if play_url:
+                            break
+                    except:
+                        pass
+
+                # Priority 2: downloadAddr / playAddr
+                if not play_url:
+                    for key in ("downloadAddr", "playAddr"):
+                        val = video_data.get(key)
+                        if isinstance(val, str) and val:
+                            play_url = val; break
+                        elif isinstance(val, list) and val:
+                            play_url = val[0]; break
+
+                video_path = v_path / f"video__{file_prefix}.mp4"
+                success    = False
+
+                if play_url:
+                    try:
+                        resp = await self.client.get(
+                            play_url, headers=self.headers, timeout=90, follow_redirects=True)
                         if resp.status_code == 200:
                             video_path.write_bytes(resp.content)
                             logger.success(f"{log_prefix} 📥 Video Saved (Direct).")
                             success = True
                         else:
-                            logger.warning(f"{log_prefix} ⚠️ Direct download failed ({resp.status_code}), trying yt-dlp...")
+                            logger.warning(f"{log_prefix} ⚠️ Direct {resp.status_code} → yt-dlp...")
                     except Exception as e:
-                        logger.warning(f"{log_prefix} ⚠️ Direct download error: {e}, trying yt-dlp...")
+                        logger.warning(f"{log_prefix} ⚠️ Direct error → yt-dlp: {e}")
 
                 if not success:
+                    logger.info(f"{log_prefix} 🔄 yt-dlp fallback...")
                     if await asyncio.to_thread(download_with_ytdlp, url, video_path):
                         logger.success(f"{log_prefix} 📥 Video Saved (yt-dlp).")
-                        success = True
                     else:
-                        logger.error(f"{log_prefix} ❌ Video Download Failed.")
+                        logger.error(f"{log_prefix} ❌ Video download failed.")
 
-                audio_url = item.get("music", {}).get("playUrl")
+                # Audio (background music)
+                music_data = item.get("music", {})
+                audio_url  = music_data.get("playUrl")
+                if isinstance(audio_url, dict):
+                    audio_url = audio_url.get("urlList", [None])[0]
                 if isinstance(audio_url, list):
                     audio_url = audio_url[0]
                 if audio_url:
                     await self.download_file_httpx(
-                        audio_url,
-                        v_path / f"{base_name_format}_Audio_{post_ts}_{v_id}.mp3",
-                        log_prefix, "Audio")
+                        audio_url, v_path / f"audio__{file_prefix}.mp3", log_prefix, "Audio")
 
-        await self.fetch_comments(v_id, v_path, base_name_format, post_ts, log_prefix)
+        # ── 3. COMMENTS ────────────────────────────────────────────────────
+        await self.fetch_comments(v_id, v_path, file_prefix, log_prefix)
+
+        # ── 4. UPLOAD + TRACK ──────────────────────────────────────────────
         await upload_to_mega(v_path, folder_prefix, log_prefix)
         await track_success(url, file_lock)
         return True
@@ -340,61 +385,93 @@ class TikTokScraperV4:
         async with self.sem_comments:
             cursor, has_more = 0, 1
             while has_more:
-                params = {"item_id": video_id, "comment_id": comment_id,
-                          "cursor": cursor, "count": 50, "aid": "1988"}
                 try:
                     resp = await self.client.get(
                         "https://www.tiktok.com/api/comment/list/reply/",
-                        params=params, headers=self.headers)
-                    data = resp.json()
+                        params={"item_id": video_id, "comment_id": comment_id,
+                                "cursor": cursor, "count": 50, "aid": "1988"},
+                        headers=self.headers)
+                    data    = resp.json()
                     replies = data.get("comments") or []
                     if not replies:
                         break
                     raw_list.extend(replies)
                     for c in replies:
-                        clean_list.append({"cid": c.get("cid"), "text": c.get("text"),
-                                           "user": c.get("user", {}).get("unique_id"), "is_reply": True})
+                        clean_list.append({
+                            "is_reply":          True,
+                            "parent_comment_id": comment_id,
+                            "cid":               c.get("cid"),
+                            "text":              c.get("text"),
+                            "likes":             c.get("digg_count"),
+                            "create_time":       c.get("create_time"),
+                            "user":              {"username": c.get("user", {}).get("unique_id")}
+                        })
                     has_more = data.get("has_more", 0)
-                    cursor = data.get("cursor", cursor + len(replies))
+                    cursor   = data.get("cursor", cursor + len(replies))
                     await asyncio.sleep(random.uniform(*self.cfg["delay_between_pages"]))
                 except:
                     break
 
-    async def fetch_comments(self, video_id, path, base_name_format, post_ts, log_prefix):
-        raw_comments, clean_comments, cursor, has_more = [], [], 0, 1
-        raw_path   = path / f"{base_name_format}_RAWComments_{post_ts}_{video_id}.json"
-        clean_path = path / f"{base_name_format}_CleanComments_{post_ts}_{video_id}.json"
+    async def fetch_comments(self, video_id, path, file_prefix, log_prefix):
+        raw_path   = path / f"RAW_comments__{file_prefix}.json"
+        clean_path = path / f"comments__{file_prefix}.json"
+
+        raw_comments, clean_comments, cursor = [], [], 0
+
+        # Resume: agar files pehle se hain
+        if raw_path.exists() and clean_path.exists():
+            try:
+                raw_comments   = json.loads(raw_path.read_text(encoding="utf-8"))
+                clean_comments = json.loads(clean_path.read_text(encoding="utf-8"))
+                cursor         = len([c for c in clean_comments if not c.get("is_reply")])
+                logger.info(f"{log_prefix} 🔄 Resuming from {cursor} comments...")
+            except:
+                raw_comments, clean_comments, cursor = [], [], 0
+
+        if len(raw_comments) >= self.cfg["max_comments_limit"]:
+            return True
+
         logger.info(f"{log_prefix} 💬 Fetching comments...")
+        has_more = 1
 
         while has_more and len(raw_comments) < self.cfg["max_comments_limit"]:
             async with self.sem_comments:
-                params = {"aweme_id": video_id, "cursor": cursor, "count": 50, "aid": "1988"}
                 try:
                     resp = await self.client.get(
                         "https://www.tiktok.com/api/comment/list/",
-                        params=params, headers=self.headers)
+                        params={"aweme_id": video_id, "cursor": cursor, "count": 50, "aid": "1988"},
+                        headers=self.headers)
                     data = resp.json()
                 except:
                     break
 
-            comments = data.get("comments") or []
-            if not comments:
+            curr_batch = data.get("comments") or []
+            if not curr_batch:
                 break
-            raw_comments.extend(comments)
 
+            raw_comments.extend(curr_batch)
             reply_tasks = []
-            for c in comments:
-                clean_comments.append({"cid": c.get("cid"), "text": c.get("text"),
-                                       "user": c.get("user", {}).get("unique_id"), "is_reply": False})
+            for c in curr_batch:
+                clean_comments.append({
+                    "is_reply":    False,
+                    "cid":         c.get("cid"),
+                    "text":        c.get("text"),
+                    "likes":       c.get("digg_count"),
+                    "reply_total": c.get("reply_comment_total"),
+                    "create_time": c.get("create_time"),
+                    "user":        {"username": c.get("user", {}).get("unique_id")}
+                })
                 if c.get("reply_comment_total", 0) > 0:
                     reply_tasks.append(
                         self.fetch_replies(video_id, c.get("cid"), raw_comments, clean_comments, log_prefix))
 
             if reply_tasks:
                 await asyncio.gather(*reply_tasks)
+
             has_more = data.get("has_more", 0)
-            cursor = data.get("cursor", cursor + len(comments))
-            raw_path.write_text(json.dumps(raw_comments, indent=2, ensure_ascii=False), encoding="utf-8")
+            cursor   = data.get("cursor", cursor + len(curr_batch))
+
+            raw_path.write_text(json.dumps(raw_comments,    indent=2, ensure_ascii=False), encoding="utf-8")
             clean_path.write_text(json.dumps(clean_comments, indent=2, ensure_ascii=False), encoding="utf-8")
 
             if len(raw_comments) % 100 < 50:
@@ -402,12 +479,13 @@ class TikTokScraperV4:
             await asyncio.sleep(random.uniform(*self.cfg["delay_between_pages"]))
 
         logger.success(f"{log_prefix} 🎉 Comments Done: {len(raw_comments)}")
+        return True
 
     async def close(self):
         await self.client.aclose()
 
 # ---------------------------------------------------------
-# 9. Worker
+# 8. Worker
 # ---------------------------------------------------------
 async def worker_task(scraper, url, index, total, sem_video, file_lock):
     async with sem_video:
@@ -421,52 +499,43 @@ async def worker_task(scraper, url, index, total, sem_video, file_lock):
             return False
 
 # ---------------------------------------------------------
-# 10. Main
+# 9. Main
 # ---------------------------------------------------------
 async def main():
     if not os.path.exists("links.txt"):
         logger.error("❌ links.txt not found!")
         return
 
-    # Load all URLs
-    all_urls = [l.strip() for l in open("links.txt", encoding="utf-8") if l.strip()]
-
-    # Load already completed (success) — skip karo
+    all_urls  = [l.strip() for l in open("links.txt", encoding="utf-8") if l.strip()]
     done_urls = load_set_from_file(COMPLETED_FILE)
 
-    # Load previously failed — retry karo is run mein
     failed_urls = load_set_from_file(FAILED_FILE)
-
-    # Clear failed.txt so fresh tracking starts (jo fail honge wapas likhenge)
     if failed_urls:
         open(FAILED_FILE, "w").close()
         logger.info(f"🔄 Retrying {len(failed_urls)} previously failed URLs.")
 
-    # Pending = (all + previously failed) - already done
     retry_set = failed_urls - done_urls
     new_set   = set(all_urls) - done_urls - retry_set
     pending   = list(retry_set) + [u for u in all_urls if u in new_set]
-
-    # Skipped = in all_urls jo already done hain
-    skipped = [u for u in all_urls if u in done_urls]
+    skipped   = [u for u in all_urls if u in done_urls]
 
     if not pending:
-        logger.info("✅ All links already done — nothing to process.")
+        logger.info("✅ All links already done.")
         return
 
     logger.info(
         f"🚀 Batch Start | Folder: {BATCH_FOLDER_NAME}\n"
-        f"   Total in links.txt : {len(all_urls)}\n"
-        f"   Already done (skip): {len(skipped)}\n"
-        f"   Retrying failed    : {len(retry_set)}\n"
-        f"   New to process     : {len(new_set)}\n"
-        f"   Pending this run   : {len(pending)}"
+        f"   Total links.txt  : {len(all_urls)}\n"
+        f"   Done (skip)      : {len(skipped)}\n"
+        f"   Retry failed     : {len(retry_set)}\n"
+        f"   New              : {len(new_set)}\n"
+        f"   Pending          : {len(pending)}\n"
+        f"   Concurrency      : {CONFIG['video_concurrency']} videos parallel"
     )
 
-    # Write skipped entries to tracking report
     file_lock = asyncio.Lock()
     for u in skipped:
-        await track_skipped(u, "Already completed in previous run", file_lock)
+        await track_skipped(u, "Already completed", file_lock)
 
     sem_video = asyncio.Semaphore(CONFIG["video_concurrency"])
     scraper   = TikTokScraperV4(CONFIG)
@@ -480,30 +549,27 @@ async def main():
     finally:
         await scraper.close()
 
-    # Final summary in tracking file
     done_final   = load_set_from_file(COMPLETED_FILE)
     failed_final = load_set_from_file(FAILED_FILE)
+
     async with file_lock:
         with open(TRACKING_FILE, "a", encoding="utf-8") as f:
             f.write("\n" + "="*60 + "\n")
-            f.write(f"RUN COMPLETE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"  Total processed : {len(pending)}\n")
-            f.write(f"  Success         : {len(done_final)}\n")
-            f.write(f"  Failed          : {len(failed_final)}\n")
-            f.write(f"  Skipped         : {len(skipped)}\n")
+            f.write(f"RUN COMPLETE : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"  Processed  : {len(pending)}\n")
+            f.write(f"  Success    : {len(done_final)}\n")
+            f.write(f"  Failed     : {len(failed_final)}\n")
+            f.write(f"  Skipped    : {len(skipped)}\n")
             f.write("="*60 + "\n")
 
     logger.success(
-        f"\n{'='*50}\n"
-        f"✅ RUN COMPLETE\n"
+        f"\n{'='*50}\n✅ RUN COMPLETE\n"
         f"   Success : {len(done_final)}\n"
         f"   Failed  : {len(failed_final)}\n"
-        f"   Skipped : {len(skipped)}\n"
-        f"{'='*50}"
+        f"   Skipped : {len(skipped)}\n{'='*50}"
     )
 
-    # Upload all report files to Mega
-    logger.info("📤 Uploading report files to Mega...")
+    logger.info("📤 Uploading reports to Mega...")
     await upload_report_files()
 
 if __name__ == "__main__":
