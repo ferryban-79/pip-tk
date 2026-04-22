@@ -1,0 +1,105 @@
+name: 🕷️ TikTok Scraper
+
+on:
+  # ── Manual trigger (GitHub UI se "Run workflow" button)
+  workflow_dispatch:
+    inputs:
+      batch_name:
+        description: 'Custom batch folder name (optional — leave blank for auto)'
+        required: false
+        default: ''
+
+  # ── Auto schedule: har roz 2 AM Pakistan time (9 PM UTC)
+  schedule:
+    - cron: '0 21 * * *'
+
+jobs:
+  scrape:
+    name: Run TikTok Scraper
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # ~6 hours hard limit (free tier)
+
+    steps:
+      # ── Step 1: Code checkout
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Step 2: Python setup with pip cache
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── Step 3: Install Python dependencies
+      - name: 📦 Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── Step 4: Always update yt-dlp to latest (TikTok API changes fast)
+      - name: ⬆️ Update yt-dlp to latest
+        run: pip install -U yt-dlp
+
+      # ── Step 5: Install rclone
+      - name: ☁️ Install rclone
+        run: curl https://rclone.org/install.sh | sudo bash
+
+      # ── Step 6: Configure rclone from GitHub Secret
+      - name: 🔧 Setup rclone config
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG_CONTENT }}" > ~/.config/rclone/rclone.conf
+          echo "✅ rclone configured"
+
+      # ── Step 7: Restore tracking files from previous run (artifact cache)
+      #    Ye step pehle run pe skip hoga, baad mein resume karta hai
+      - name: 🔄 Restore tracking files from previous run
+        uses: actions/download-artifact@v4
+        with:
+          name: scraper-tracking
+          path: .
+        continue-on-error: true   # pehli baar artifact nahi hoga — error ignore karo
+
+      # ── Step 8: Show current state before run
+      - name: 📊 Pre-run status
+        run: |
+          echo "=== links.txt ===" && wc -l links.txt || echo "links.txt not found!"
+          echo "=== completed.txt ===" && (wc -l completed.txt 2>/dev/null || echo "0 lines (fresh start)")
+          echo "=== failed.txt ===" && (wc -l failed.txt 2>/dev/null || echo "0 lines (no failed)")
+
+      # ── Step 9: Run the scraper
+      - name: 🚀 Run scraper
+        env:
+          BATCH_FOLDER_NAME: ${{ github.event.inputs.batch_name }}
+        run: python scraper-fixed.py
+
+      # ── Step 10: Save tracking files as artifact (next run will restore these)
+      - name: 💾 Save tracking files artifact
+        if: always()   # fail hone pe bhi save karo
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-tracking
+          path: |
+            completed.txt
+            failed.txt
+            tracking_report.txt
+            scraper_log.txt
+          retention-days: 30
+          overwrite: true   # har run pe overwrite karo
+
+      # ── Step 11: Show final summary in GitHub Actions log
+      - name: 📋 Final run summary
+        if: always()
+        run: |
+          echo "=============================="
+          echo "       SCRAPER SUMMARY        "
+          echo "=============================="
+          if [ -f tracking_report.txt ]; then
+            tail -20 tracking_report.txt
+          else
+            echo "No tracking_report.txt found."
+          fi
+          echo ""
+          echo "--- Counts ---"
+          echo "SUCCESS : $(grep -c '^\[.*\] \[SUCCESS\]' tracking_report.txt 2>/dev/null || echo 0)"
+          echo "FAILED  : $(grep -c '^\[.*\] \[FAILED\]'  tracking_report.txt 2>/dev/null || echo 0)"
+          echo "SKIPPED : $(grep -c '^\[.*\] \[SKIPPED\]' tracking_report.txt 2>/dev/null || echo 0)"
